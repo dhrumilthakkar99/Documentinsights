@@ -7,3 +7,4 @@ sentence-transformers
 huggingface-hub
 langchain-text-splitters
 langchain-core
+langchain-huggingface
