@@ -48,8 +48,7 @@ if st.session_state.vectorstore:
                 with st.spinner("Generating summary..."):
                     llm = HuggingFaceEndpoint(
                         repo_id="facebook/bart-large-cnn",
-                        huggingfacehub_api_token=api_token,
-                        max_length=130
+                        huggingfacehub_api_token=api_token
                     )
                     summary = llm.invoke(st.session_state.text[:1024])
                     st.write(summary)
