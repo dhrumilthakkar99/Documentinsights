@@ -1,13 +1,22 @@
 # app.py
+"""
+Streamlit Document Summarization & Q&A
+
+Requirements:
+pip install streamlit PyPDF2 langchain-text-splitters langchain-huggingface langchain-community faiss-cpu
+
+Set HUGGINGFACE_API_TOKEN in your environment or Streamlit secrets.
+"""
+
 import os
 import streamlit as st
 from PyPDF2 import PdfReader
 
-# LangChain-ish helpers you already used
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain_community.vectorstores import FAISS
 
+# --- Page config
 st.set_page_config(page_title="Document Q&A", layout="wide")
 st.title("📄 Document Summarization & Q&A")
 
@@ -18,42 +27,47 @@ if "text" not in st.session_state:
     st.session_state.text = ""
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
+if "debug_raw" not in st.session_state:
+    st.session_state.debug_raw = False
 
-# --- Upload
-uploaded_file = st.file_uploader("Upload Document (PDF or TXT)", type=["pdf", "txt"])
-
-if uploaded_file:
-    if uploaded_file.type == "application/pdf":
-        pdf_reader = PdfReader(uploaded_file)
-        pages = [page.extract_text() or "" for page in pdf_reader.pages]
-        st.session_state.text = "\n\n".join(pages)
-    else:
-        st.session_state.text = uploaded_file.read().decode("utf-8")
-
-    st.success(f"Document loaded: {len(st.session_state.text)} characters")
-
-# --- Processing controls
+# --- Sidebar controls
 st.sidebar.header("Processing Options")
 chunk_size = st.sidebar.number_input("Chunk size", min_value=200, max_value=4000, value=1000, step=100)
 chunk_overlap = st.sidebar.number_input("Chunk overlap", min_value=0, max_value=1000, value=200, step=50)
 top_k = st.sidebar.number_input("Top K documents for retrieval", min_value=1, max_value=10, value=4, step=1)
+st.sidebar.markdown("---")
+st.session_state.debug_raw = st.sidebar.checkbox("Show raw LLM response", value=False)
 
+# --- Upload area
+uploaded_file = st.file_uploader("Upload Document (PDF or TXT)", type=["pdf", "txt"])
+
+if uploaded_file:
+    try:
+        if uploaded_file.type == "application/pdf":
+            pdf_reader = PdfReader(uploaded_file)
+            pages = [page.extract_text() or "" for page in pdf_reader.pages]
+            st.session_state.text = "\n\n".join(pages)
+        else:
+            st.session_state.text = uploaded_file.read().decode("utf-8")
+        st.success(f"Document loaded: {len(st.session_state.text)} characters")
+    except Exception as e:
+        st.error(f"Failed to read uploaded file: {e}")
+
+# --- Process document button
 if st.button("Process Document") and st.session_state.text:
     with st.spinner("Splitting text and creating embeddings..."):
-        # 1) split text
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        chunks = text_splitter.split_text(st.session_state.text)
-        st.session_state.chunks = chunks
-
-        # 2) create embeddings and vectorstore
         try:
+            text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+            chunks = text_splitter.split_text(st.session_state.text)
+            st.session_state.chunks = chunks
+
             embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
             st.session_state.vectorstore = FAISS.from_texts(chunks, embeddings)
             st.success(f"Document processed into {len(chunks)} chunks and indexed.")
         except Exception as e:
             st.error(f"Failed to create embeddings or vectorstore: {e}")
 
-# --- Require vectorstore for downstream tabs
+# --- Require vectorstore for downstream
 if not st.session_state.vectorstore:
     st.info("Upload and process a document to enable Summary and Q&A.")
     st.stop()
@@ -64,34 +78,78 @@ if not api_token:
     st.error("⚠️ HUGGINGFACE_API_TOKEN not found. Set it in environment or Streamlit secrets.")
     st.stop()
 
-# --- Tabs for Summary and Q&A
+# --- Tabs
 tab1, tab2 = st.tabs(["📝 Summary", "❓ Q&A"])
 
+# --- Helper to normalize LLM responses
+def normalize_llm_response(raw):
+    """
+    Normalize common Hugging Face endpoint return shapes to a string.
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, dict):
+        # common keys
+        for key in ("summary_text", "generated_text", "output", "text", "result"):
+            if key in raw and raw[key]:
+                return raw[key]
+        # sometimes the response is nested or a list
+        # try to stringify useful parts
+        if "error" in raw:
+            return f"ERROR: {raw['error']}"
+        return str(raw)
+    if isinstance(raw, (list, tuple)):
+        # join simple lists
+        try:
+            return "\n".join([normalize_llm_response(r) for r in raw])
+        except Exception:
+            return str(raw)
+    return str(raw)
+
+# --- Summary tab
 with tab1:
     st.markdown("**Generate a short summary of the document.**")
     summary_max_input = st.slider("Max input characters to summarize (trim long docs)", 256, 8192, 2048, step=256)
     if st.button("Generate Summary"):
         with st.spinner("Generating summary..."):
+            input_text = st.session_state.text[:summary_max_input]
+            # Try to call a summarization model with explicit summarization payload first
             try:
-                # Use a summarization model endpoint
                 llm = HuggingFaceEndpoint(
-                    repo_id="google/flan-t5-large",
+                    repo_id="facebook/bart-large-cnn",
                     huggingfacehub_api_token=api_token,
                     task="summarization"
                 )
-                # Trim input to model-friendly size
-                input_text = st.session_state.text[:summary_max_input]
-                raw = llm.invoke(input_text)  # wrapper may accept string or dict
-                # Normalize response
-                if isinstance(raw, dict):
-                    summary = raw.get("summary_text") or raw.get("generated_text") or str(raw)
-                else:
-                    summary = str(raw)
+                # prefer dict payload for summarization models
+                payload = {"inputs": input_text, "parameters": {"max_length": 256}}
+                raw = llm.invoke(payload)
+            except Exception as e1:
+                # fallback: use an instruction-following text-generation model
+                try:
+                    llm = HuggingFaceEndpoint(
+                        repo_id="google/flan-t5-large",
+                        huggingfacehub_api_token=api_token
+                    )
+                    prompt = "Summarize the following text in 3 sentences:\n\n" + input_text
+                    raw = llm.invoke({"inputs": prompt})
+                except Exception as e2:
+                    st.error(f"Summarization failed: {e2}")
+                    raw = None
+
+            if st.session_state.debug_raw:
+                st.subheader("Raw LLM Response")
+                st.write(raw)
+
+            summary = normalize_llm_response(raw)
+            if summary:
                 st.subheader("Summary")
                 st.write(summary)
-            except Exception as e:
-                st.error(f"Summarization failed: {e}")
+            else:
+                st.warning("No summary returned. Toggle debug to inspect raw response.")
 
+# --- Q&A tab
 with tab2:
     st.markdown("**Ask a question about the document.**")
     question = st.text_input("Question", "")
@@ -102,9 +160,10 @@ with tab2:
                 docs = st.session_state.vectorstore.similarity_search(question, k=int(top_k))
                 if not docs:
                     st.warning("No relevant documents found.")
+                    st.stop()
                 context = "\n\n".join([d.page_content for d in docs])
 
-                # 2) build a prompt
+                # 2) build prompt
                 prompt_template = (
                     "You are an assistant that answers questions using the provided context.\n\n"
                     "Context:\n{context}\n\n"
@@ -113,24 +172,27 @@ with tab2:
                 )
                 prompt_text = prompt_template.format(context=context, question=question)
 
-                # 3) call the LLM endpoint
+                # 3) call the LLM endpoint (instruction-following model)
                 llm = HuggingFaceEndpoint(
                     repo_id="google/flan-t5-large",
                     huggingfacehub_api_token=api_token
                 )
-                raw = llm.invoke(prompt_text)  # wrapper may accept string or dict
 
-                # 4) normalize output
-                if isinstance(raw, dict):
-                    # common keys: 'generated_text', 'summary_text', 'output'
-                    answer = raw.get("generated_text") or raw.get("summary_text") or raw.get("output") or str(raw)
-                else:
-                    answer = str(raw)
+                # Try string first, then dict if wrapper expects inputs key
+                try:
+                    raw = llm.invoke(prompt_text)
+                except Exception:
+                    raw = llm.invoke({"inputs": prompt_text})
 
+                if st.session_state.debug_raw:
+                    st.subheader("Raw LLM Response")
+                    st.write(raw)
+
+                answer = normalize_llm_response(raw)
                 st.subheader("Answer")
                 st.write(answer)
 
-                # optional: show retrieved snippets for transparency
+                # show retrieved snippets for transparency
                 with st.expander("Retrieved snippets"):
                     for i, d in enumerate(docs, start=1):
                         st.markdown(f"**Snippet {i}**")
