@@ -1,2 +1,2 @@
-# Documen-Insights
+# Document-Insights
 PDF chatbot
