@@ -117,25 +117,27 @@ with tab1:
         with st.spinner("Generating summary..."):
             input_text = st.session_state.text[:summary_max_input]
 
+            # Build a string prompt (HuggingFaceEndpoint.invoke expects a string) [1](https://docs.langchain.com/oss/python/integrations/llms/huggingface_endpoint)[2](https://sj-langchain.readthedocs.io/en/latest/llms/langchain.llms.huggingface_endpoint.HuggingFaceEndpoint.html)
+            prompt = (
+                "Summarize the following text in 3–5 bullet points. "
+                "Focus on key ideas and outcomes.\n\n"
+                f"{input_text}"
+            )
+
+            raw = None
             try:
+                # Try an instruction model (more robust than forcing summarization task)
                 llm = HuggingFaceEndpoint(
-                    repo_id="google/flan-t5-large",
+                    repo_id="mistralai/Mistral-7B-Instruct-v0.2",
                     huggingfacehub_api_token=api_token,
-                    temperature=0.0,
+                    temperature=0.2,
                     max_new_tokens=256,
+                    # provider="auto",  # optional: set a specific provider if needed
                 )
-
-                prompt = (
-                    "Summarize the following text in 3-5 sentences. "
-                    "Focus on the main ideas and key details.\n\n"
-                    f"{input_text}"
-                )
-
                 raw = llm.invoke(prompt)  # string only
-
             except Exception as e:
-                st.error(f"Summarization failed: {e}")
-                raw = None
+                st.error("Summarization failed (Mistral). Showing exception:")
+                st.exception(e)
 
             if st.session_state.debug_raw:
                 st.subheader("Raw LLM Response")
@@ -146,8 +148,8 @@ with tab1:
                 st.subheader("Summary")
                 st.write(summary)
             else:
-                st.warning("No summary returned. Toggle debug to inspect raw response.")
-
+                st.warning("No summary returned. Enable debug and check the exception output above.")
+                
 # --- Q&A tab
 with tab2:
     st.markdown("**Ask a question about the document.**")
