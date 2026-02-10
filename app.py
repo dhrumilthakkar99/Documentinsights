@@ -3,7 +3,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_community.llms import HuggingFaceHub
-from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from PyPDF2 import PdfReader
 import os
 
@@ -52,6 +54,12 @@ if st.session_state.vectorstore:
             with st.spinner("Finding answer..."):
                 llm = HuggingFaceHub(repo_id="google/flan-t5-large",
                                      huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_TOKEN"))
-                qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=st.session_state.vectorstore.as_retriever())
-                answer = qa_chain.run(question)
+                prompt = PromptTemplate.from_template("Answer based on context:\n{context}\n\nQuestion: {question}")
+                qa_chain = (
+                    {"context": st.session_state.vectorstore.as_retriever(), "question": RunnablePassthrough()}
+                    | prompt
+                    | llm
+                    | StrOutputParser()
+                )
+                answer = qa_chain.invoke(question)
                 st.write(answer)
