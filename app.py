@@ -182,7 +182,7 @@ with tab2:
                 try:
                     raw = llm.invoke(prompt_text)
                 except Exception:
-                    raw = llm.invoke({"inputs": prompt_text})
+                    raw = llm.invoke({prompt_text})
 
                 if st.session_state.debug_raw:
                     st.subheader("Raw LLM Response")
