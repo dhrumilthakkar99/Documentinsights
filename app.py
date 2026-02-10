@@ -45,7 +45,7 @@ if st.session_state.vectorstore:
             with st.spinner("Generating summary..."):
                 llm = HuggingFaceHub(repo_id="facebook/bart-large-cnn", 
                                      huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_TOKEN"))
-                summary = llm(st.session_state.text[:1024])
+                summary = llm.invoke(st.session_state.text[:1024])
                 st.write(summary)
     
     with tab2:
