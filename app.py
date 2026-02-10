@@ -112,31 +112,30 @@ def normalize_llm_response(raw):
 with tab1:
     st.markdown("**Generate a short summary of the document.**")
     summary_max_input = st.slider("Max input characters to summarize (trim long docs)", 256, 8192, 2048, step=256)
+
     if st.button("Generate Summary"):
         with st.spinner("Generating summary..."):
             input_text = st.session_state.text[:summary_max_input]
-            # Try to call a summarization model with explicit summarization payload first
+
             try:
                 llm = HuggingFaceEndpoint(
-                    repo_id="facebook/bart-large-cnn",
+                    repo_id="google/flan-t5-large",
                     huggingfacehub_api_token=api_token,
-                    task="summarization"
+                    temperature=0.0,
+                    max_new_tokens=256,
                 )
-                # prefer dict payload for summarization models
-                payload = {"inputs": input_text, "parameters": {"max_length": 256}}
-                raw = llm.invoke(payload)
-            except Exception as e1:
-                # fallback: use an instruction-following text-generation model
-                try:
-                    llm = HuggingFaceEndpoint(
-                        repo_id="google/flan-t5-large",
-                        huggingfacehub_api_token=api_token
-                    )
-                    prompt = "Summarize the following text in 3 sentences:\n\n" + input_text
-                    raw = llm.invoke({"inputs": prompt})
-                except Exception as e2:
-                    st.error(f"Summarization failed: {e2}")
-                    raw = None
+
+                prompt = (
+                    "Summarize the following text in 3-5 sentences. "
+                    "Focus on the main ideas and key details.\n\n"
+                    f"{input_text}"
+                )
+
+                raw = llm.invoke(prompt)  # string only
+
+            except Exception as e:
+                st.error(f"Summarization failed: {e}")
+                raw = None
 
             if st.session_state.debug_raw:
                 st.subheader("Raw LLM Response")
