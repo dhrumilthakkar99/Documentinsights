@@ -38,28 +38,37 @@ if uploaded_file:
             st.success("Document processed!")
 
 if st.session_state.vectorstore:
-    tab1, tab2 = st.tabs(["📝 Summary", "❓ Q&A"])
-    
-    with tab1:
-        if st.button("Generate Summary"):
-            with st.spinner("Generating summary..."):
-                llm = HuggingFaceHub(repo_id="facebook/bart-large-cnn", 
-                                     huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_TOKEN"))
-                summary = llm.invoke(st.session_state.text[:1024])
-                st.write(summary)
-    
-    with tab2:
-        question = st.text_input("Ask a question about the document:")
-        if question:
-            with st.spinner("Finding answer..."):
-                llm = HuggingFaceHub(repo_id="google/flan-t5-large",
-                                     huggingfacehub_api_token=os.getenv("HUGGINGFACE_API_TOKEN"))
-                prompt = PromptTemplate.from_template("Answer based on context:\n{context}\n\nQuestion: {question}")
-                qa_chain = (
-                    {"context": st.session_state.vectorstore.as_retriever(), "question": RunnablePassthrough()}
-                    | prompt
-                    | llm
-                    | StrOutputParser()
-                )
-                answer = qa_chain.invoke(question)
-                st.write(answer)
+    api_token = os.getenv("HUGGINGFACE_API_TOKEN")
+    if not api_token:
+        st.error("⚠️ HUGGINGFACE_API_TOKEN not found. Please set it in Streamlit secrets.")
+    else:
+        tab1, tab2 = st.tabs(["📝 Summary", "❓ Q&A"])
+        
+        with tab1:
+            if st.button("Generate Summary"):
+                with st.spinner("Generating summary..."):
+                    llm = HuggingFaceHub(
+                        repo_id="facebook/bart-large-cnn",
+                        huggingfacehub_api_token=api_token,
+                        model_kwargs={"temperature": 0.5, "max_length": 130}
+                    )
+                    summary = llm.invoke(st.session_state.text[:1024])
+                    st.write(summary)
+        
+        with tab2:
+            question = st.text_input("Ask a question about the document:")
+            if question:
+                with st.spinner("Finding answer..."):
+                    llm = HuggingFaceHub(
+                        repo_id="google/flan-t5-large",
+                        huggingfacehub_api_token=api_token
+                    )
+                    prompt = PromptTemplate.from_template("Answer based on context:\n{context}\n\nQuestion: {question}")
+                    qa_chain = (
+                        {"context": st.session_state.vectorstore.as_retriever(), "question": RunnablePassthrough()}
+                        | prompt
+                        | llm
+                        | StrOutputParser()
+                    )
+                    answer = qa_chain.invoke(question)
+                    st.write(answer)
