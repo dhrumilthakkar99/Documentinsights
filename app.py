@@ -1,8 +1,7 @@
 import streamlit as st
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain_community.vectorstores import FAISS
-from langchain_community.llms import HuggingFaceHub
 from langchain_core.prompts import PromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -47,10 +46,10 @@ if st.session_state.vectorstore:
         with tab1:
             if st.button("Generate Summary"):
                 with st.spinner("Generating summary..."):
-                    llm = HuggingFaceHub(
+                    llm = HuggingFaceEndpoint(
                         repo_id="facebook/bart-large-cnn",
                         huggingfacehub_api_token=api_token,
-                        model_kwargs={"temperature": 0.5, "max_length": 130}
+                        max_length=130
                     )
                     summary = llm.invoke(st.session_state.text[:1024])
                     st.write(summary)
@@ -59,7 +58,7 @@ if st.session_state.vectorstore:
             question = st.text_input("Ask a question about the document:")
             if question:
                 with st.spinner("Finding answer..."):
-                    llm = HuggingFaceHub(
+                    llm = HuggingFaceEndpoint(
                         repo_id="google/flan-t5-large",
                         huggingfacehub_api_token=api_token
                     )
