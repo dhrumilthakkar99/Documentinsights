@@ -75,7 +75,7 @@ with tab1:
             try:
                 # Use a summarization model endpoint
                 llm = HuggingFaceEndpoint(
-                    repo_id="facebook/bart-large-cnn",
+                    repo_id="google/flan-t5-large",
                     huggingfacehub_api_token=api_token,
                     task="summarization"
                 )
