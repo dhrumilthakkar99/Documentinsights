@@ -1,11 +1,17 @@
 streamlit
+pymupdf
+pillow
+openai
 langchain
+langchain-text-splitters
+langchain-huggingface
 langchain-community
-PyPDF2
+langchain-qdrant
+qdrant-client
 faiss-cpu
 sentence-transformers
-huggingface-hub
-langchain-text-splitters
-langchain-core
-langchain-huggingface
-openai
+
+# Optional parsing enhancements
+pdfplumber
+unstructured
+pytesseract
