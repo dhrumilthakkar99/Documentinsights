@@ -24,6 +24,7 @@ import traceback
 import uuid
 import html
 import json
+import inspect
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -267,6 +268,14 @@ def dependency_available(module_name: str) -> bool:
         return True
     except Exception:
         return False
+
+_COMPONENTS_HTML_SUPPORTS_KEY = "key" in inspect.signature(components.html).parameters
+
+def render_html_component(html_block: str, height: int, key: Optional[str] = None):
+    kwargs = {"height": height}
+    if _COMPONENTS_HTML_SUPPORTS_KEY and key:
+        kwargs["key"] = key
+    return components.html(html_block, **kwargs)
 
 
 # ----------------------------
@@ -972,7 +981,7 @@ def render_selectable_text(text: str, key: str, height: int = 220, button_label:
       }};
     </script>
     """
-    return components.html(html_block, height=height, key=key)
+    return render_html_component(html_block, height=height, key=key)
 
 def find_page_for_text(text: str) -> Optional[str]:
     hay = st.session_state.text or ""
@@ -1045,7 +1054,7 @@ def render_selection_links(selections: list[dict], key: str = "selection_links")
       }});
     </script>
     """
-    return components.html(html_block, height=min(220, 42 + len(items) * 24), key=key)
+    return render_html_component(html_block, height=min(220, 42 + len(items) * 24), key=key)
 
 def render_pdf_viewer(pdf_bytes: bytes, page: int, highlight_terms: Optional[list[str]], height: int = 640, key: str = "pdf_viewer"):
     if not pdf_bytes:
@@ -1161,7 +1170,7 @@ def render_pdf_viewer(pdf_bytes: bytes, page: int, highlight_terms: Optional[lis
       }});
     </script>
     """
-    return components.html(html_block, height=height + 20, key=key)
+    return render_html_component(html_block, height=height + 20, key=key)
 
 def render_answer_with_citations(answer: str, snippet_records: list[dict]) -> str:
     mapping = {}
