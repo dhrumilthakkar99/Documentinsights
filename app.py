@@ -984,6 +984,8 @@ def render_selectable_text(text: str, key: str, height: int = 220, button_label:
     return render_html_component(html_block, height=height, key=key)
 
 def find_page_for_text(text: str) -> Optional[str]:
+    if not isinstance(text, str):
+        return None
     hay = st.session_state.text or ""
     needle = (text or "").strip()
     if not hay or not needle:
@@ -1209,6 +1211,9 @@ def append_to_composer(text: str, label: Optional[str] = None):
         st.session_state.composer_text = f"{prefix}{text}".strip()
 
 def maybe_add_selection(selection: str, state_key: str, label: Optional[str] = None, page: Optional[str] = None, source: str = "snippet"):
+    if not isinstance(selection, str):
+        return
+    selection = selection.strip()
     if not selection:
         return
     if st.session_state.get(state_key) == selection:
@@ -1879,7 +1884,7 @@ with tab2:
 
         st.subheader("Selection Links")
         selection_payload = render_selection_links(st.session_state.selection_links, key="selection_links_view")
-        if selection_payload:
+        if isinstance(selection_payload, str) and selection_payload:
             try:
                 data = json.loads(selection_payload)
                 page = int(data.get("page") or 1)
