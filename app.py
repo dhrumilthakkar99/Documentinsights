@@ -21,6 +21,7 @@ import base64
 import time
 import sqlite3
 import traceback
+import contextlib
 import uuid
 import html
 import json
@@ -122,8 +123,13 @@ def apply_modern_theme():
         }
         .cite {
             color: var(--accent);
-            cursor: help;
             border-bottom: 1px dotted var(--accent);
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .cite:hover {
+            color: #7cdaf7;
+            border-bottom-color: #7cdaf7;
         }
         </style>
         """,
@@ -166,6 +172,17 @@ def init_chat_db():
             ts TEXT NOT NULL
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sandbox_cells (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            code TEXT NOT NULL,
+            stdout TEXT NOT NULL,
+            stderr TEXT NOT NULL,
+            images_json TEXT NOT NULL,
+            ts TEXT NOT NULL
+        )
+    """)
     con.commit()
     con.close()
 
@@ -191,6 +208,56 @@ def clear_history(session_id: str):
     con = sqlite3.connect(CHAT_DB_PATH)
     cur = con.cursor()
     cur.execute("DELETE FROM chat_messages WHERE session_id=?", (session_id,))
+    con.commit()
+    con.close()
+
+def load_sandbox_cells(session_id: str) -> List[dict]:
+    con = sqlite3.connect(CHAT_DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "SELECT id, code, stdout, stderr, images_json, ts FROM sandbox_cells WHERE session_id=? ORDER BY id ASC",
+        (session_id,),
+    )
+    rows = cur.fetchall()
+    con.close()
+    out = []
+    for row in rows:
+        images = []
+        try:
+            images = json.loads(row[4] or "[]")
+        except Exception:
+            images = []
+        out.append({
+            "id": row[0],
+            "code": row[1] or "",
+            "stdout": row[2] or "",
+            "stderr": row[3] or "",
+            "images": images,
+            "ts": row[5] or "",
+        })
+    return out
+
+def append_sandbox_cell(session_id: str, code: str, stdout_text: str, stderr_text: str, images: List[str]):
+    con = sqlite3.connect(CHAT_DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO sandbox_cells (session_id, code, stdout, stderr, images_json, ts) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            session_id,
+            code or "",
+            stdout_text or "",
+            stderr_text or "",
+            json.dumps(images or []),
+            datetime.utcnow().isoformat(),
+        ),
+    )
+    con.commit()
+    con.close()
+
+def clear_sandbox_cells(session_id: str):
+    con = sqlite3.connect(CHAT_DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM sandbox_cells WHERE session_id=?", (session_id,))
     con.commit()
     con.close()
 
@@ -248,11 +315,20 @@ if "viewer_highlight_terms" not in st.session_state:
     st.session_state.viewer_highlight_terms = []
 if "last_query_terms" not in st.session_state:
     st.session_state.last_query_terms = []
+if "sandbox_code" not in st.session_state:
+    st.session_state.sandbox_code = ""
+if "sandbox_globals" not in st.session_state:
+    st.session_state.sandbox_globals = {}
+if "sandbox_cells" not in st.session_state:
+    st.session_state.sandbox_cells = []
+if "sandbox_last_result" not in st.session_state:
+    st.session_state.sandbox_last_result = {"stdout": "", "stderr": "", "images": []}
 
 SESSION_ID = st.session_state.session_id
 init_chat_db()
 if "history_synced" not in st.session_state:
     st.session_state.chat_history = load_history(SESSION_ID)
+    st.session_state.sandbox_cells = load_sandbox_cells(SESSION_ID)
     st.session_state.history_synced = True
 
 
@@ -1200,6 +1276,160 @@ def render_answer_with_citations(answer: str, snippet_records: list[dict]) -> st
     safe = safe.replace("\n", "<br/>")
     return safe
 
+CITATION_REF_RE = re.compile(r"\[(S\d+)\]")
+
+def extract_citation_records(answer: str, snippet_records: list[dict]) -> list[dict]:
+    if not answer:
+        return []
+    ids = []
+    for sid in CITATION_REF_RE.findall(answer or ""):
+        if sid not in ids:
+            ids.append(sid)
+
+    by_id = {rec.get("id"): rec for rec in (snippet_records or []) if rec.get("id")}
+    out = []
+    for sid in ids:
+        rec = by_id.get(sid)
+        if not rec:
+            continue
+        page = rec.get("page") or infer_page_from_text(rec.get("text", "")) or "1"
+        out.append({
+            "id": sid,
+            "page": str(page),
+            "chunk_type": rec.get("chunk_type") or "snippet",
+            "text": rec.get("text") or "",
+        })
+    return out
+
+def jump_to_citation(citation: dict):
+    page = citation.get("page") or "1"
+    st.session_state.viewer_page = int(page) if str(page).isdigit() else 1
+    terms = selection_to_terms(citation.get("text") or "", limit=6)
+    if terms:
+        st.session_state.viewer_highlight_terms = terms
+    st.session_state.selected_snippet_id = citation.get("id")
+
+ALLOWED_SANDBOX_IMPORTS = {
+    "math", "statistics", "random", "json", "re", "datetime", "itertools",
+    "functools", "collections", "numpy", "pandas", "matplotlib",
+}
+
+SAFE_SANDBOX_BUILTINS = {
+    "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict, "enumerate": enumerate,
+    "float": float, "int": int, "len": len, "list": list, "max": max, "min": min,
+    "pow": pow, "print": print, "range": range, "reversed": reversed, "round": round,
+    "set": set, "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+}
+
+def _sandbox_import(name, globals=None, locals=None, fromlist=(), level=0):
+    root = (name or "").split(".")[0]
+    if root not in ALLOWED_SANDBOX_IMPORTS:
+        raise ImportError(f"Import blocked in sandbox: {root}")
+    return __import__(name, globals, locals, fromlist, level)
+
+def run_python_sandbox(code: str) -> dict:
+    code = (code or "").strip()
+    if not code:
+        return {"stdout": "", "stderr": "No code provided.", "images": []}
+
+    env = st.session_state.sandbox_globals or {}
+    env["__builtins__"] = dict(SAFE_SANDBOX_BUILTINS, __import__=_sandbox_import)
+
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+    images = []
+
+    try:
+        with contextlib.redirect_stdout(stdout_buffer), contextlib.redirect_stderr(stderr_buffer):
+            exec(code, env, env)
+    except Exception:
+        stderr_buffer.write(traceback.format_exc())
+
+    try:
+        import matplotlib.pyplot as plt
+        for fig_num in plt.get_fignums():
+            fig = plt.figure(fig_num)
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", bbox_inches="tight")
+            images.append(base64.b64encode(buf.getvalue()).decode("utf-8"))
+        plt.close("all")
+    except Exception:
+        pass
+
+    st.session_state.sandbox_globals = env
+    return {
+        "stdout": stdout_buffer.getvalue(),
+        "stderr": stderr_buffer.getvalue(),
+        "images": images,
+    }
+
+def extract_python_code_blocks(text: str) -> list[str]:
+    blocks = re.findall(r"```python\s*(.*?)```", text or "", flags=re.IGNORECASE | re.DOTALL)
+    return [b.strip() for b in blocks if (b or "").strip()]
+
+def build_notebook_export(cells: list[dict]) -> str:
+    nb_cells = []
+    for cell in cells:
+        code = cell.get("code") or ""
+        stdout_text = cell.get("stdout") or ""
+        stderr_text = cell.get("stderr") or ""
+        outputs = []
+        if stdout_text:
+            outputs.append({"output_type": "stream", "name": "stdout", "text": stdout_text})
+        if stderr_text:
+            outputs.append({"output_type": "stream", "name": "stderr", "text": stderr_text})
+        nb_cells.append({
+            "cell_type": "code",
+            "execution_count": None,
+            "metadata": {},
+            "source": code,
+            "outputs": outputs,
+        })
+    notebook = {
+        "cells": nb_cells,
+        "metadata": {"language_info": {"name": "python"}},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    return json.dumps(notebook, indent=2)
+
+def build_report_export(cells: list[dict]) -> str:
+    lines = ["# Workspace Report", ""]
+    for i, cell in enumerate(cells or [], start=1):
+        lines.append(f"## Cell {i}")
+        lines.append("")
+        lines.append("```python")
+        lines.append((cell.get("code") or "").rstrip())
+        lines.append("```")
+        if cell.get("stdout"):
+            lines.append("")
+            lines.append("**stdout**")
+            lines.append("")
+            lines.append("```text")
+            lines.append((cell.get("stdout") or "").rstrip())
+            lines.append("```")
+        if cell.get("stderr"):
+            lines.append("")
+            lines.append("**stderr**")
+            lines.append("")
+            lines.append("```text")
+            lines.append((cell.get("stderr") or "").rstrip())
+            lines.append("```")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+def get_last_user_question(history: list[dict]) -> str:
+    for msg in reversed(history or []):
+        if msg.get("role") == "user":
+            return msg.get("content") or ""
+    return ""
+
+def get_last_assistant_message(history: list[dict]) -> str:
+    for msg in reversed(history or []):
+        if msg.get("role") == "assistant":
+            return msg.get("content") or ""
+    return ""
+
 def append_to_composer(text: str, label: Optional[str] = None):
     if not text:
         return
@@ -1245,11 +1475,12 @@ st.sidebar.header("KB Backend")
 kb_backend = st.sidebar.selectbox("Knowledge Base storage", ["Qdrant Cloud (API key)", "FAISS (Local fallback)"], index=0)
 
 st.sidebar.markdown("---")
-st.sidebar.header("LLaVA Enrichment")
-do_page_ocr = st.sidebar.checkbox("Page OCR-like transcription", value=True)
+st.sidebar.header("External OCR / Vision")
+st.sidebar.caption("Disabled by default for privacy. Enable only if you explicitly want external OCR calls.")
+do_page_ocr = st.sidebar.checkbox("Page OCR-like transcription", value=False)
 page_ocr_mode = st.sidebar.selectbox("Page OCR mode", ["auto", "all"], index=0)
-do_image_ocr = st.sidebar.checkbox("OCR embedded images (figures/tables)", value=True)
-do_visual_explain = st.sidebar.checkbox("Explain visual content (tables/figures)", value=True)
+do_image_ocr = st.sidebar.checkbox("OCR embedded images (figures/tables)", value=False)
+do_visual_explain = st.sidebar.checkbox("Explain visual content (tables/figures)", value=False)
 
 st.sidebar.markdown("---")
 st.sidebar.header("Parsing Enhancements")
@@ -1278,28 +1509,17 @@ if st.sidebar.button("Clear chat history"):
     clear_history(SESSION_ID)
     st.toast("Chat history cleared.")
 
+if st.sidebar.button("Clear workspace sandbox"):
+    st.session_state.sandbox_code = ""
+    st.session_state.sandbox_globals = {}
+    st.session_state.sandbox_cells = []
+    st.session_state.sandbox_last_result = {"stdout": "", "stderr": "", "images": []}
+    clear_sandbox_cells(SESSION_ID)
+    st.toast("Workspace sandbox cleared.")
+
 st.sidebar.markdown("---")
-st.sidebar.header("Document Viewer")
-sidebar_records = build_snippet_records(st.session_state.last_retrieved_docs)
-sidebar_selected = get_selected_snippet(sidebar_records)
-if sidebar_selected:
-    st.sidebar.caption(build_snippet_label(sidebar_selected))
-    sidebar_selection = render_selectable_text(
-        sidebar_selected.get("text", ""),
-        key="sidebar_doc_view",
-        height=260,
-        button_label="Use selection",
-        highlight_terms=st.session_state.last_query_terms,
-    )
-    maybe_add_selection(
-        sidebar_selection,
-        "last_selection_doc_side",
-        label="Snippet",
-        page=sidebar_selected.get("page"),
-        source="snippet",
-    )
-else:
-    st.sidebar.info("Retrieve snippets to enable the document viewer.")
+st.sidebar.header("Workspace")
+st.sidebar.caption("Use the Q&A tab for the unified document, retrieval, and Python sandbox workspace.")
 
 
 # ----------------------------
@@ -1307,10 +1527,10 @@ else:
 # ----------------------------
 hf_token = get_secret("HUGGINGFACE_API_TOKEN", None)
 groq_key = get_secret("GROQ_API_KEY", None)
-if not hf_token:
-    st.warning("⚠️ HUGGINGFACE_API_TOKEN missing. LLaVA enrichment and primary LLM route will not work.")
+if not hf_token and (do_page_ocr or do_image_ocr or do_visual_explain):
+    st.warning("HUGGINGFACE_API_TOKEN missing. External OCR/vision is enabled but cannot run.")
 if not groq_key:
-    st.warning("ℹ️ GROQ_API_KEY missing. LLM fallback won't work if primary fails.")
+    st.warning("GROQ_API_KEY missing. LLM fallback won't work if primary route fails.")
 
 
 # ----------------------------
@@ -1626,8 +1846,8 @@ if uploaded_file:
         st.success(f"Document loaded: {len(st.session_state.text)} characters")
         if getattr(st.session_state, "_extra_texts", []):
             st.info(f"Extracted {len(st.session_state._extra_texts)} extra snippets (OCR/captions/tables/figures/advanced parsing).")
-        if uploaded_file.type == "application/pdf" and not hf_token:
-            st.warning("LLaVA enrichment is disabled because HUGGINGFACE_API_TOKEN is missing.")
+        if uploaded_file.type == "application/pdf" and not hf_token and (do_page_ocr or do_image_ocr or do_visual_explain):
+            st.warning("External OCR/vision is disabled because HUGGINGFACE_API_TOKEN is missing.")
     except Exception as e:
         st.error(f"Failed to read uploaded file: {e}")
 
@@ -1782,141 +2002,300 @@ with tab1:
 # Q&A tab - Table/figure aware + follow-up reuse + anti-false-not-found
 # ----------------------------
 with tab2:
-    st.markdown("**Chat with the knowledge base.**")
+    st.markdown("**Chat-first workspace: thread on the left, unified viewer/sandbox on the right.**")
 
-    col_chat, col_tools = st.columns([2.2, 1])
+    snippet_records = build_snippet_records(st.session_state.last_retrieved_docs)
+    selected_record = get_selected_snippet(snippet_records)
 
+    pending_question = None
     user_question = None
     send_composer = False
+    send_followup = False
+
+    col_chat, col_workspace = st.columns([1.55, 1.25], gap="large")
 
     with col_chat:
-        for msg in st.session_state.chat_history:
+        st.subheader("Chat")
+        for midx, msg in enumerate(st.session_state.chat_history):
             with st.chat_message("user" if msg["role"] == "user" else "assistant"):
                 if msg.get("role") == "assistant" and msg.get("snippets"):
                     st.markdown(
                         render_answer_with_citations(msg.get("content", ""), msg.get("snippets", [])),
                         unsafe_allow_html=True,
                     )
+                    citations = extract_citation_records(msg.get("content", ""), msg.get("snippets", []))
+                    if citations:
+                        st.caption("Citations")
+                        ncols = min(4, max(1, len(citations)))
+                        ccols = st.columns(ncols)
+                        for cidx, cit in enumerate(citations):
+                            label = f"{cit['id']} p.{cit['page']}"
+                            with ccols[cidx % ncols]:
+                                if st.button(label, key=f"msg_cite_{midx}_{cidx}", use_container_width=True):
+                                    jump_to_citation(cit)
+                                    st.rerun()
                 else:
                     st.write(msg.get("content", ""))
 
-        user_question = st.chat_input("Ask a question about the knowledge base")
+        st.text_area(
+            "Compose your next message",
+            key="composer_text",
+            height=110,
+            placeholder="Ask directly, or reuse selected snippet/history text.",
+        )
+        c_send1, c_send2 = st.columns(2)
+        with c_send1:
+            send_composer = st.button("Send message", use_container_width=True, key="send_message_btn")
+        with c_send2:
+            send_followup = st.button("Send selected + message", use_container_width=True, key="send_selected_btn")
 
-        st.subheader("PDF Viewer")
-        if st.session_state.pdf_bytes:
-            max_page = st.session_state.pdf_page_count or 1
-            viewer_page_input = st.number_input(
-                "Page",
-                min_value=1,
-                max_value=max_page,
-                value=int(st.session_state.viewer_page or 1),
-                step=1,
-                key="viewer_page_input",
-            )
-            if viewer_page_input != st.session_state.viewer_page:
-                st.session_state.viewer_page = int(viewer_page_input)
-            viewer_key = f"pdf_viewer_main_{st.session_state.viewer_page}_{abs(hash(tuple(st.session_state.viewer_highlight_terms or []))) % 10000}"
-            render_pdf_viewer(
-                st.session_state.pdf_bytes,
-                page=int(st.session_state.viewer_page or 1),
-                highlight_terms=st.session_state.viewer_highlight_terms,
-                height=640,
-                key=viewer_key,
-            )
-        else:
-            st.info("Upload a PDF to enable the viewer.")
+        user_question = st.chat_input("Quick ask")
 
-    with col_tools:
-        st.subheader("Snippet Explorer")
-        snippet_records = build_snippet_records(st.session_state.last_retrieved_docs)
-        selected_record = get_selected_snippet(snippet_records)
+    with col_workspace:
+        st.subheader("Workspace")
+        ws_doc, ws_retrieval, ws_sandbox, ws_history = st.tabs(
+            ["Document", "Retrieval Inspector", "Python Sandbox", "History"]
+        )
 
-        if snippet_records and selected_record:
-            options = [r["id"] for r in snippet_records]
-            labels = {r["id"]: build_snippet_label(r) for r in snippet_records}
-            selected_id = st.selectbox(
-                "Retrieved snippets",
-                options=options,
-                index=options.index(selected_record["id"]) if selected_record["id"] in options else 0,
-                format_func=lambda x: labels.get(x, x),
-                key="main_snippet_select",
-            )
-            st.session_state.selected_snippet_id = selected_id
-            selected_record = get_selected_snippet(snippet_records)
-
-            if selected_record:
+        with ws_doc:
+            if snippet_records and selected_record:
+                options = [r["id"] for r in snippet_records]
+                labels = {r["id"]: build_snippet_label(r) for r in snippet_records}
+                selected_id = st.selectbox(
+                    "Retrieved snippets",
+                    options=options,
+                    index=options.index(selected_record["id"]) if selected_record["id"] in options else 0,
+                    format_func=lambda x: labels.get(x, x),
+                    key="workspace_snippet_select",
+                )
+                st.session_state.selected_snippet_id = selected_id
+                selected_record = get_selected_snippet(snippet_records)
                 st.caption(build_snippet_label(selected_record))
-                main_doc_selection = render_selectable_text(
+                doc_selection = render_selectable_text(
                     selected_record.get("text", ""),
-                    key="main_doc_view",
-                    height=260,
+                    key="workspace_doc_view",
+                    height=220,
                     button_label="Use selection",
                     highlight_terms=st.session_state.last_query_terms,
                 )
                 maybe_add_selection(
-                    main_doc_selection,
+                    doc_selection,
                     "last_selection_doc_main",
                     label="Snippet",
                     page=selected_record.get("page"),
                     source="snippet",
                 )
-        else:
-            st.info("No snippets yet. Ask a question to retrieve context.")
+            else:
+                st.info("Ask a question to retrieve snippets.")
 
-        st.subheader("History Viewer")
-        history_text = build_history_view_text(st.session_state.chat_history, max_messages=20)
-        if history_text:
-            history_selection = render_selectable_text(
-                history_text,
-                key="history_view",
-                height=220,
-                button_label="Use selection",
+            if st.session_state.pdf_bytes:
+                max_page = st.session_state.pdf_page_count or 1
+                viewer_page_input = st.number_input(
+                    "Viewer page",
+                    min_value=1,
+                    max_value=max_page,
+                    value=int(st.session_state.viewer_page or 1),
+                    step=1,
+                    key="workspace_viewer_page",
+                )
+                if viewer_page_input != st.session_state.viewer_page:
+                    st.session_state.viewer_page = int(viewer_page_input)
+                viewer_key = f"pdf_workspace_{st.session_state.viewer_page}_{abs(hash(tuple(st.session_state.viewer_highlight_terms or []))) % 10000}"
+                render_pdf_viewer(
+                    st.session_state.pdf_bytes,
+                    page=int(st.session_state.viewer_page or 1),
+                    highlight_terms=st.session_state.viewer_highlight_terms,
+                    height=560,
+                    key=viewer_key,
+                )
+            else:
+                st.info("Upload a PDF to enable the document viewer.")
+
+        with ws_retrieval:
+            st.caption("Citation links")
+            if snippet_records:
+                for ridx, rec in enumerate(snippet_records):
+                    rid = rec.get("id") or f"S{ridx+1}"
+                    rpage = rec.get("page") or "1"
+                    rtype = rec.get("chunk_type") or "snippet"
+                    lbl = f"{rid} | p.{rpage} | {rtype}"
+                    if st.button(lbl, key=f"retrieval_link_{ridx}", use_container_width=True):
+                        jump_to_citation({
+                            "id": rid,
+                            "page": rpage,
+                            "text": rec.get("text") or "",
+                            "chunk_type": rtype,
+                        })
+                        st.rerun()
+            else:
+                st.info("No retrieval context yet.")
+
+            st.markdown("**Selection links**")
+            selection_payload = render_selection_links(st.session_state.selection_links, key="selection_links_view")
+            if isinstance(selection_payload, str) and selection_payload:
+                try:
+                    data = json.loads(selection_payload)
+                    page = int(data.get("page") or 1)
+                    st.session_state.viewer_page = page
+                    terms = selection_to_terms(data.get("text") or "")
+                    if terms:
+                        st.session_state.viewer_highlight_terms = terms
+                    st.rerun()
+                except Exception:
+                    pass
+            elif not st.session_state.selection_links:
+                st.info("Selections appear here as jump links.")
+
+        with ws_sandbox:
+            st.caption("Local per-session Python workspace")
+            last_assistant = get_last_assistant_message(st.session_state.chat_history)
+            extracted_blocks = extract_python_code_blocks(last_assistant)
+            c_seed1, c_seed2 = st.columns(2)
+            with c_seed1:
+                if st.button("Use latest assistant code", use_container_width=True, key="seed_latest_code"):
+                    if extracted_blocks:
+                        st.session_state.sandbox_code = extracted_blocks[-1]
+                    elif last_assistant:
+                        st.session_state.sandbox_code = last_assistant
+                    else:
+                        st.info("No assistant response available yet.")
+            with c_seed2:
+                if st.button("Generate analysis code", use_container_width=True, key="gen_sandbox_code"):
+                    last_q = get_last_user_question(st.session_state.chat_history)
+                    if not last_q:
+                        st.info("Ask at least one question first.")
+                    else:
+                        context_chunks = []
+                        for rec in snippet_records[:4]:
+                            context_chunks.append(f"[{rec.get('id')}] {(rec.get('text') or '')[:1200]}")
+                        gen_messages = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Generate executable Python for analysis. "
+                                    "Return only one ```python``` block. "
+                                    "No placeholders, no prose."
+                                ),
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Question:\n{last_q}\n\nContext:\n" + "\n\n".join(context_chunks),
+                            },
+                        ]
+                        gen = llm_chat_with_fallback(
+                            model_id=model_id,
+                            messages=gen_messages,
+                            temperature=min(temperature, 0.4),
+                            max_tokens=max_tokens,
+                            hf_token=hf_token,
+                            groq_key=groq_key,
+                            debug=st.session_state.debug_raw,
+                        )
+                        gen_text = normalize_text(gen.get("content", ""))
+                        blocks = extract_python_code_blocks(gen_text)
+                        st.session_state.sandbox_code = blocks[0] if blocks else gen_text
+
+            st.text_area("Sandbox code", key="sandbox_code", height=280)
+            run_col, reset_col = st.columns(2)
+            run_clicked = run_col.button("Run code", use_container_width=True, key="sandbox_run_btn")
+            reset_clicked = reset_col.button("Reset kernel", use_container_width=True, key="sandbox_reset_btn")
+
+            if reset_clicked:
+                st.session_state.sandbox_globals = {}
+                st.success("Sandbox kernel reset.")
+
+            if run_clicked:
+                result = run_python_sandbox(st.session_state.sandbox_code)
+                st.session_state.sandbox_last_result = result
+                cell = {
+                    "id": len(st.session_state.sandbox_cells) + 1,
+                    "code": st.session_state.sandbox_code,
+                    "stdout": result.get("stdout") or "",
+                    "stderr": result.get("stderr") or "",
+                    "images": result.get("images") or [],
+                    "ts": datetime.utcnow().isoformat(),
+                }
+                st.session_state.sandbox_cells.append(cell)
+                append_sandbox_cell(
+                    SESSION_ID,
+                    code=cell["code"],
+                    stdout_text=cell["stdout"],
+                    stderr_text=cell["stderr"],
+                    images=cell["images"],
+                )
+
+            last_result = st.session_state.sandbox_last_result or {}
+            if last_result.get("stdout"):
+                st.markdown("**stdout**")
+                st.code(last_result["stdout"], language="text")
+            if last_result.get("stderr"):
+                st.markdown("**stderr**")
+                st.code(last_result["stderr"], language="text")
+            if last_result.get("images"):
+                st.markdown("**plots**")
+                for img_b64 in last_result.get("images", []):
+                    try:
+                        st.image(base64.b64decode(img_b64))
+                    except Exception:
+                        continue
+
+            st.markdown("**Workspace history**")
+            if st.session_state.sandbox_cells:
+                for hidx, cell in enumerate(reversed(st.session_state.sandbox_cells[-8:]), start=1):
+                    with st.expander(f"Cell {len(st.session_state.sandbox_cells) - hidx + 1}"):
+                        st.code(cell.get("code") or "", language="python")
+                        if cell.get("stdout"):
+                            st.code(cell.get("stdout") or "", language="text")
+                        if cell.get("stderr"):
+                            st.code(cell.get("stderr") or "", language="text")
+                        if st.button("Load into editor", key=f"load_cell_{hidx}", use_container_width=True):
+                            st.session_state.sandbox_code = cell.get("code") or ""
+                            st.rerun()
+            else:
+                st.info("No sandbox runs yet.")
+
+            notebook_payload = build_notebook_export(st.session_state.sandbox_cells)
+            report_payload = build_report_export(st.session_state.sandbox_cells)
+            ex1, ex2 = st.columns(2)
+            ex1.download_button(
+                "Export notebook",
+                data=notebook_payload,
+                file_name="workspace.ipynb",
+                mime="application/json",
+                use_container_width=True,
             )
-            maybe_add_selection(
-                history_selection,
-                "last_selection_history",
-                label="History",
-                page=None,
-                source="history",
+            ex2.download_button(
+                "Export report",
+                data=report_payload,
+                file_name="workspace_report.md",
+                mime="text/markdown",
+                use_container_width=True,
             )
-        else:
-            st.info("No chat history yet.")
 
-        st.subheader("Selection Links")
-        selection_payload = render_selection_links(st.session_state.selection_links, key="selection_links_view")
-        if isinstance(selection_payload, str) and selection_payload:
-            try:
-                data = json.loads(selection_payload)
-                page = int(data.get("page") or 1)
-                st.session_state.viewer_page = page
-                terms = selection_to_terms(data.get("text") or "")
-                if terms:
-                    st.session_state.viewer_highlight_terms = terms
-                st.rerun()
-            except Exception:
-                pass
-        elif not st.session_state.selection_links:
-            st.info("Selections will appear here as jump links.")
+        with ws_history:
+            history_text = build_history_view_text(st.session_state.chat_history, max_messages=30)
+            if history_text:
+                history_selection = render_selectable_text(
+                    history_text,
+                    key="history_view",
+                    height=420,
+                    button_label="Use selection",
+                )
+                maybe_add_selection(
+                    history_selection,
+                    "last_selection_history",
+                    label="History",
+                    page=None,
+                    source="history",
+                )
+            else:
+                st.info("No chat history yet.")
 
-        st.subheader("Prompt Composer")
-        st.text_area(
-            "Compose your next message",
-            key="composer_text",
-            height=120,
-            placeholder="Select text from snippets or history, then add your question.",
-        )
-        send_followup = st.button("Send selection as follow-up", use_container_width=True)
-        send_composer = st.button("Send composer", use_container_width=True)
-
-    pending_question = None
     if send_followup:
         selection = (st.session_state.last_selected_text or "").strip()
         composer_text = (st.session_state.composer_text or "").strip()
         if selection and composer_text:
-            if selection not in composer_text:
-                pending_question = f"{selection}\n\n{composer_text}"
-            else:
-                pending_question = composer_text
+            pending_question = f"{selection}\n\n{composer_text}" if selection not in composer_text else composer_text
         else:
             pending_question = selection or composer_text
         if pending_question:
